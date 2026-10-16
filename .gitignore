@@ -1,0 +1,6 @@
+# Personal usage data - history, reports and logs. Never commit.
+data/
+
+# Usage exports written elsewhere (e.g. Get-ClaudeCodeUsage.ps1 writes to the current folder)
+*.csv
+*.log
