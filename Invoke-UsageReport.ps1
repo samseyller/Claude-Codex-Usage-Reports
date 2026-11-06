@@ -7,7 +7,8 @@
   1. Collect - reads local session logs and upserts per day / session / project / model token totals
      into <DataFolder>/<tool>/history/usage-<computer>.csv:
        Claude Code  ~/.claude/projects/**/*.jsonl   (Claude Code deletes these after ~30 days)
-       Codex        ~/.codex/sessions/**/*.jsonl and ~/.codex/archived_sessions
+       Codex        ~/.codex/sessions/**/*.jsonl[.zst] and ~/.codex/archived_sessions
+                    (compressed .zst files need the zstd command-line tool)
      The history files are the lifetime record. A row is only replaced by one with at least as many
      requests, so logs expiring never shrink it.
 
@@ -465,60 +466,85 @@ function Read-CodexLogs([datetime]$Cutoff) {
     $roots = @('sessions', 'archived_sessions' | ForEach-Object { Join-Path $CodexHome $_ } | Where-Object { Test-Path $_ })
     if (-not $roots) { Write-Warning "No Codex sessions under $CodexHome"; return $agg }
     $seen  = [System.Collections.Generic.HashSet[string]]::new()
-    $files = @(Get-ChildItem -Path $roots -Recurse -Filter *.jsonl -File | Where-Object LastWriteTime -ge $Cutoff)
+    $files = @(Get-ChildItem -Path $roots -Recurse -File | Where-Object { $_.Name -match '\.jsonl(\.zst)?$' -and $_.LastWriteTime -ge $Cutoff })
+
+    # Codex compresses its older rollout files. Without zstd, skip them: history rows are kept, so
+    # the next run with zstd available (and -FullScan if they've left the lookback) catches up.
+    $zstd = (Get-Command zstd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $zstd) {
+        $skipped = @($files | Where-Object Extension -eq '.zst')
+        if ($skipped) {
+            Write-Warning "Skipping $($skipped.Count) compressed Codex session file(s) because zstd is not installed. Install it with: winget install Meta.Zstandard"
+            $files = @($files | Where-Object Extension -ne '.zst')
+        }
+    }
     Write-Host "Codex: scanning $($files.Count) session file(s)..."
 
     foreach ($file in $files) {
         $session = ''; $cwd = ''; $model = ''; $prevTotal = $null
         $records = [System.Collections.Generic.List[object]]::new()
         $counts  = [System.Collections.Generic.List[object]]::new()
-        foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
-            if (-not ($line.Contains('"token_usage_record"') -or $line.Contains('"token_count"') -or
-                      $line.Contains('"turn_context"') -or $line.Contains('"session_meta"'))) { continue }
-            try { $doc = [System.Text.Json.JsonDocument]::Parse($line) } catch { continue }
-            try {
-                $e = $doc.RootElement
-                $p = Get-JProp $e 'payload'
-                if ($null -eq $p) { continue }
-                $ts = Get-JString $e 'timestamp'
-                switch (Get-JString $e 'type') {
-                    'session_meta' {
-                        if (-not $session) { $session = Get-JString $p 'id'; $cwd = Get-JString $p 'cwd' }
-                    }
-                    'turn_context' {
-                        $m = Get-JString $p 'model'; if ($m) { $model = $m }
-                        $c = Get-JString $p 'cwd';   if ($c) { $cwd = $c }
-                    }
-                    'token_usage_record' {
-                        $u = Get-JProp $p 'usage'
-                        if ($null -ne $u) {
-                            $records.Add(@{ Key = 'r|' + (Get-JString $p 'response_id'); Ts = $ts; Model = $model; Cwd = $cwd
+        $path = $file.FullName; $temp = $null
+        if ($file.Extension -eq '.zst') {
+            $temp = (New-TemporaryFile).FullName
+            & $zstd -dqf -o $temp -- $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+                Remove-Item $temp -ErrorAction SilentlyContinue
+                Write-Warning "Could not decompress $($file.FullName); skipping it."
+                continue
+            }
+            $path = $temp
+        }
+        try {
+            foreach ($line in [System.IO.File]::ReadLines($path)) {
+                if (-not ($line.Contains('"token_usage_record"') -or $line.Contains('"token_count"') -or
+                          $line.Contains('"turn_context"') -or $line.Contains('"session_meta"'))) { continue }
+                try { $doc = [System.Text.Json.JsonDocument]::Parse($line) } catch { continue }
+                try {
+                    $e = $doc.RootElement
+                    $p = Get-JProp $e 'payload'
+                    if ($null -eq $p) { continue }
+                    $ts = Get-JString $e 'timestamp'
+                    switch (Get-JString $e 'type') {
+                        'session_meta' {
+                            if (-not $session) { $session = Get-JString $p 'id'; $cwd = Get-JString $p 'cwd' }
+                        }
+                        'turn_context' {
+                            $m = Get-JString $p 'model'; if ($m) { $model = $m }
+                            $c = Get-JString $p 'cwd';   if ($c) { $cwd = $c }
+                        }
+                        'token_usage_record' {
+                            $u = Get-JProp $p 'usage'
+                            if ($null -ne $u) {
+                                $records.Add(@{ Key = 'r|' + (Get-JString $p 'response_id'); Ts = $ts; Model = $model; Cwd = $cwd
+                                    In = Get-JLong $u 'input_tokens'; Cached = Get-JLong $u 'cached_input_tokens'
+                                    Write = Get-JLong $u 'cache_write_input_tokens'; Out = Get-JLong $u 'output_tokens'
+                                    Reason = Get-JLong $u 'reasoning_output_tokens' })
+                            }
+                        }
+                        'event_msg' {
+                            if ((Get-JString $p 'type') -ne 'token_count') { break }
+                            $info = Get-JProp $p 'info'
+                            if ($null -eq $info) { break }
+                            $total = Get-JProp $info 'total_token_usage'
+                            $u     = Get-JProp $info 'last_token_usage'
+                            if ($null -eq $total -or $null -eq $u) { break }
+                            $raw = $total.GetRawText()
+                            if ($raw -eq $prevTotal) { break }
+                            $prevTotal = $raw
+                            $counts.Add(@{ Key = "t|$session|$ts|$raw"; Ts = $ts; Model = $model; Cwd = $cwd
                                 In = Get-JLong $u 'input_tokens'; Cached = Get-JLong $u 'cached_input_tokens'
                                 Write = Get-JLong $u 'cache_write_input_tokens'; Out = Get-JLong $u 'output_tokens'
                                 Reason = Get-JLong $u 'reasoning_output_tokens' })
                         }
                     }
-                    'event_msg' {
-                        if ((Get-JString $p 'type') -ne 'token_count') { break }
-                        $info = Get-JProp $p 'info'
-                        if ($null -eq $info) { break }
-                        $total = Get-JProp $info 'total_token_usage'
-                        $u     = Get-JProp $info 'last_token_usage'
-                        if ($null -eq $total -or $null -eq $u) { break }
-                        $raw = $total.GetRawText()
-                        if ($raw -eq $prevTotal) { break }
-                        $prevTotal = $raw
-                        $counts.Add(@{ Key = "t|$session|$ts|$raw"; Ts = $ts; Model = $model; Cwd = $cwd
-                            In = Get-JLong $u 'input_tokens'; Cached = Get-JLong $u 'cached_input_tokens'
-                            Write = Get-JLong $u 'cache_write_input_tokens'; Out = Get-JLong $u 'output_tokens'
-                            Reason = Get-JLong $u 'reasoning_output_tokens' })
-                    }
                 }
+                finally { $doc.Dispose() }
             }
-            finally { $doc.Dispose() }
         }
+        finally { if ($temp) { Remove-Item $temp -ErrorAction SilentlyContinue } }
 
-        if (-not $session) { $session = $file.BaseName }
+        if (-not $session) { $session = $file.Name -replace '\.jsonl(\.zst)?$' }
         foreach ($r in $(if ($records.Count) { $records } else { $counts })) {
             if (-not $seen.Add($r.Key)) { continue }
             $local = [datetimeoffset]::Parse($r.Ts, $Inv).LocalDateTime

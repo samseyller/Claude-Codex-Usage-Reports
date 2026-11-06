@@ -7,6 +7,7 @@ PowerShell scripts that read the local session logs of **Claude Code** and **Cod
 ## Requirements
 
 - PowerShell 7+
+- [zstd](https://github.com/facebook/zstd) on your `PATH`, to read Codex's compressed session logs (`winget install Meta.Zstandard`). Without it, those logs are skipped with a warning.
 - Windows (only for the scheduled task)
 
 ## Usage
